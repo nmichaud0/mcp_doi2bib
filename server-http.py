@@ -6,23 +6,29 @@ HTTP/SSE version for Railway deployment.
 
 import asyncio
 import httpx
-from mcp.server.models import InitializationOptions
-import mcp.types as types
-from mcp.server import NotificationOptions, Server
-from mcp.server.sse import SseServerTransport
-from starlette.applications import Starlette
-from starlette.routing import Route
-from starlette.responses import Response
-import uvicorn
+import json
 import os
+from typing import Any
+
+from mcp.server import Server
+from mcp.types import Tool, TextContent
+import mcp.server.stdio
+
+# For HTTP/SSE we need these
+from starlette.applications import Starlette
+from starlette.routing import Route, Mount
+from starlette.responses import Response, JSONResponse
+from starlette.requests import Request
+import uvicorn
+from sse_starlette import EventSourceResponse
 
 server = Server("doi-to-bibtex")
 
 @server.list_tools()
-async def handle_list_tools() -> list[types.Tool]:
+async def handle_list_tools() -> list[Tool]:
     """List available tools."""
     return [
-        types.Tool(
+        Tool(
             name="doi_to_bibtex",
             description="Convert a DOI to BibTeX format. Accepts DOIs in various formats like '10.1234/example', 'doi:10.1234/example', or full URLs like 'https://doi.org/10.1234/example'.",
             inputSchema={
@@ -85,7 +91,7 @@ async def fetch_bibtex(doi: str) -> str:
 @server.call_tool()
 async def handle_call_tool(
     name: str, arguments: dict | None
-) -> list[types.TextContent | types.ImageContent | types.EmbeddedResource]:
+) -> list[TextContent]:
     """Handle tool execution requests."""
     if name != "doi_to_bibtex":
         raise ValueError(f"Unknown tool: {name}")
@@ -98,47 +104,107 @@ async def handle_call_tool(
     try:
         bibtex = await fetch_bibtex(doi)
         return [
-            types.TextContent(
+            TextContent(
                 type="text",
                 text=bibtex
             )
         ]
     except Exception as e:
         return [
-            types.TextContent(
+            TextContent(
                 type="text",
                 text=f"Error: {str(e)}"
             )
         ]
 
-async def handle_sse(request):
-    """Handle SSE connection."""
-    async with SseServerTransport("/messages") as transport:
-        await server.run(
-            transport.read_stream,
-            transport.write_stream,
-            InitializationOptions(
-                server_name="doi-to-bibtex",
-                server_version="0.1.0",
-                capabilities=server.get_capabilities(
-                    notification_options=NotificationOptions(),
-                    experimental_capabilities={},
-                ),
-            ),
-        )
-    return Response()
+# Simple HTTP endpoints
+async def handle_health(request: Request):
+    """Health check endpoint."""
+    return JSONResponse({"status": "ok", "service": "doi-to-bibtex"})
 
-async def handle_messages(request):
-    """Handle message endpoint."""
-    return Response()
+async def handle_sse(request: Request):
+    """SSE endpoint for MCP protocol."""
+    async def event_generator():
+        # Send initial connection event
+        yield {
+            "event": "endpoint",
+            "data": json.dumps({"type": "endpoint", "url": "/message"})
+        }
+        
+        # Keep connection alive
+        while True:
+            await asyncio.sleep(30)
+            yield {"event": "ping", "data": ""}
+    
+    return EventSourceResponse(event_generator())
 
+async def handle_message(request: Request):
+    """Handle MCP messages."""
+    try:
+        data = await request.json()
+        
+        # Simple routing based on method
+        method = data.get("method", "")
+        
+        if method == "tools/list":
+            tools = await handle_list_tools()
+            tools_data = [
+                {
+                    "name": t.name,
+                    "description": t.description,
+                    "inputSchema": t.inputSchema
+                }
+                for t in tools
+            ]
+            return JSONResponse({
+                "jsonrpc": "2.0",
+                "id": data.get("id"),
+                "result": {"tools": tools_data}
+            })
+        
+        elif method == "tools/call":
+            params = data.get("params", {})
+            name = params.get("name")
+            arguments = params.get("arguments", {})
+            
+            result = await handle_call_tool(name, arguments)
+            
+            return JSONResponse({
+                "jsonrpc": "2.0",
+                "id": data.get("id"),
+                "result": {
+                    "content": [
+                        {"type": r.type, "text": r.text}
+                        for r in result
+                    ]
+                }
+            })
+        
+        else:
+            return JSONResponse({
+                "jsonrpc": "2.0",
+                "id": data.get("id"),
+                "error": {"code": -32601, "message": f"Method not found: {method}"}
+            })
+    
+    except Exception as e:
+        return JSONResponse({
+            "jsonrpc": "2.0",
+            "id": data.get("id", None),
+            "error": {"code": -32603, "message": str(e)}
+        }, status_code=500)
+
+# Create Starlette app
 app = Starlette(
+    debug=True,
     routes=[
+        Route("/", endpoint=handle_health),
+        Route("/health", endpoint=handle_health),
         Route("/sse", endpoint=handle_sse),
-        Route("/messages", endpoint=handle_messages, methods=["POST"]),
+        Route("/message", endpoint=handle_message, methods=["POST"]),
     ]
 )
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
