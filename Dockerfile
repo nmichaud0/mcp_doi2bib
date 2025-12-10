@@ -5,8 +5,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY server-http-fixed.py .
+COPY server-http.py .
 
 EXPOSE 8000
 
-CMD ["python", "server-http-fixed.py"]
+CMD ["python", "server-http.py"]
