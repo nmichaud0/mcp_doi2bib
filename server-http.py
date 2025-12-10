@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 MCP server for converting DOIs to BibTeX format.
-HTTP/SSE version for Railway deployment.
+HTTP/SSE version for Railway deployment with authentication.
 """
 
 import asyncio
@@ -19,10 +19,15 @@ from starlette.applications import Starlette
 from starlette.routing import Route, Mount
 from starlette.responses import Response, JSONResponse
 from starlette.requests import Request
+from starlette.middleware import Middleware
+from starlette.middleware.cors import CORSMiddleware
 import uvicorn
 from sse_starlette import EventSourceResponse
 
 server = Server("doi-to-bibtex")
+
+# Optional authentication token from environment
+AUTH_TOKEN = os.environ.get("AUTH_TOKEN", "")
 
 @server.list_tools()
 async def handle_list_tools() -> list[Tool]:
@@ -117,6 +122,19 @@ async def handle_call_tool(
             )
         ]
 
+def check_auth(request: Request) -> bool:
+    """Check authentication if AUTH_TOKEN is set."""
+    if not AUTH_TOKEN:
+        return True  # No auth required if not set
+    
+    # Check Authorization header
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:]
+        return token == AUTH_TOKEN
+    
+    return False
+
 # Simple HTTP endpoints
 async def handle_health(request: Request):
     """Health check endpoint."""
@@ -124,6 +142,9 @@ async def handle_health(request: Request):
 
 async def handle_sse(request: Request):
     """SSE endpoint for MCP protocol."""
+    if not check_auth(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    
     async def event_generator():
         # Send initial connection event
         yield {
@@ -140,6 +161,9 @@ async def handle_sse(request: Request):
 
 async def handle_message(request: Request):
     """Handle MCP messages."""
+    if not check_auth(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    
     try:
         data = await request.json()
         
@@ -194,7 +218,7 @@ async def handle_message(request: Request):
             "error": {"code": -32603, "message": str(e)}
         }, status_code=500)
 
-# Create Starlette app
+# Create Starlette app with CORS
 app = Starlette(
     debug=True,
     routes=[
@@ -202,9 +226,23 @@ app = Starlette(
         Route("/health", endpoint=handle_health),
         Route("/sse", endpoint=handle_sse),
         Route("/message", endpoint=handle_message, methods=["POST"]),
+    ],
+    middleware=[
+        Middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
     ]
 )
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
+    
+    if AUTH_TOKEN:
+        print(f"✓ Authentication enabled")
+    else:
+        print("⚠ No AUTH_TOKEN set - authentication disabled (not recommended for production)")
+    
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
